@@ -1,0 +1,4 @@
+ipconfig /flushdns
+Resolve-DnsName microbot1.local -ErrorAction SilentlyContinue | Format-List
+Test-NetConnection microbot1.local -Port 80 | Format-List ComputerName,RemoteAddress,TcpTestSucceeded,PingSucceeded
+curl.exe -I http://microbot1.local/status
