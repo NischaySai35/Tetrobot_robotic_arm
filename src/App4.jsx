@@ -29,15 +29,109 @@ const DEFAULT_SCRIPT = `1s30
 5s45,6s45
 4s120`;
 const POLL_MS = 500;
-const DEFAULT_LINE_DELAY = 1000;
+const DEFAULT_LINE_DELAY = 0;
 const DEFAULT_HOSTS = ["microbot1.local", "microbot2.local"];
+const DEFAULT_GRIPPER_HOST = "gripper.local";
 const ESP_PROXY_PATH = "/esp-proxy";
+const SYNC_START_BUFFER_MS = 1500;
+const GRIPPER_MIN = 20;
+const GRIPPER_MAX = 95;
+const GRIPPER_HOME = 90;
+
+const BOT1_LOCK_1_TO_2 = `homebody
+wait1000
+5s45,6s175,7s93,1s83,2s83,3s86
+wait3500
+1s3,2s54,3s23
+wait3000
+2s62,3s12
+wait2000
+5s90,4s45
+wait3000
+1s18,2s51
+wait2000
+1s83,2s83,3s86`;
+
+const BOT1_LOCK_2_TO_1 = `homebody
+wait1000
+4s45,6s175,7s93,1s83,2s83,3s86
+wait3500
+1s18,2s51,3s12
+wait3500
+1s3,2s62
+wait2000
+5s45,4s90
+wait3000
+2s54,3s23
+wait2000
+1s83,2s83,3s86`;
+
+const BOT2_LOCK_4_TO_3 = `homebody
+wait1000
+5s45,6s5,7s173,1s90,2s138,3s90
+wait3000
+1s10,2s171,3s150
+wait3500
+2s159,3s164
+wait2800
+5s90,4s45
+wait2800
+1s20,3s171
+wait3000
+1s90,2s138,3s90`;
+
+const BOT2_LOCK_3_TO_4 = `homebody
+wait1000
+4s45,6s5,7s173,1s90,2s138,3s90
+wait3000
+1s20,2s159,3s171
+wait3500
+1s10,3s164
+wait2800
+5s45,4s90
+wait2800
+2s171,3s150
+wait3000
+1s90,2s138,3s90`;
+
+const GRIPPER_DEMO_SCRIPT = `6s88,7s0,4s45
+wait3000
+1s55,2s23,3s8
+wait3000
+1s49
+wait2000
+5s135
+wait2000
+1s83
+wait600
+2s40,3s30
+wait2000
+g30
+wait1000
+g60
+wait1000
+2s60,3s30
+wait1000
+g20
+wait1500
+g90
+wait1500
+wait2000
+1s55,2s23,3s8
+wait3000
+1s49
+wait2000
+5s90
+wait3000
+1s56
+wait600
+2s40,3s30`;
 
 const clamp = (v, min, max) => Math.max(min, Math.min(max, v));
 const nowTime = () => new Date().toLocaleTimeString();
 const OFFLINE_AFTER_FAILURES = 2;
 
-function parseCommand(token) {
+function parseBotCommand(token) {
   const t = token.trim().toLowerCase();
   if (!t) return null;
 
@@ -59,6 +153,16 @@ function parseCommand(token) {
   return { type: "servo", servo, angle };
 }
 
+function parseGripperCommand(token) {
+  const t = token.trim().toLowerCase();
+  if (!t) return null;
+  if (t === "ghome" || t === "g-home" || t === "g_home") return { type: "gripper", angle: GRIPPER_HOME };
+  const m = t.match(/^g\s*(\d{1,3})$/i);
+  if (!m) return null;
+  const angle = clamp(Number(m[1]), GRIPPER_MIN, GRIPPER_MAX);
+  return { type: "gripper", angle };
+}
+
 function parseScript(script) {
   const lines = script
     .split(/\r?\n/)
@@ -68,18 +172,28 @@ function parseScript(script) {
   return lines.map((line, index) => {
     const tokens = line.split(",").map((s) => s.trim()).filter(Boolean);
     const commands = [];
+    const gripperCommands = [];
     const errors = [];
 
     for (const token of tokens) {
-      const parsed = parseCommand(token);
-      if (parsed) commands.push(parsed);
-      else errors.push(token);
+      const parsedBot = parseBotCommand(token);
+      if (parsedBot) {
+        commands.push(parsedBot);
+        continue;
+      }
+      const parsedGripper = parseGripperCommand(token);
+      if (parsedGripper) {
+        gripperCommands.push(parsedGripper);
+        continue;
+      }
+      errors.push(token);
     }
 
     return {
       index,
       raw: line,
       commands,
+      gripperCommands,
       errors,
       isValid: errors.length === 0,
     };
@@ -117,12 +231,55 @@ function toEspScript(script) {
         .map((token) => token.trim())
         .filter(Boolean)
         .map((token) => {
-          const parsed = parseCommand(token);
-          return parsed ? commandToEspToken(parsed) : token;
+          const parsed = parseBotCommand(token);
+          if (parsed) return commandToEspToken(parsed);
+          const parsedGripper = parseGripperCommand(token);
+          return parsedGripper ? "" : token;
         })
+        .filter((token) => token.length > 0)
         .join(",")
     )
     .join("\n");
+}
+
+function getWaitMsForLine(line, fallbackDelay) {
+  const waitCmd = line.commands.find((cmd) => cmd.type === "wait");
+  return waitCmd ? clamp(waitCmd.ms, 0, 999999) : fallbackDelay;
+}
+
+function getScriptMeta(lines) {
+  const errorCount = lines.reduce((acc, line) => acc + line.errors.length, 0);
+  const hasGripper = lines.some((line) => line.gripperCommands.length > 0);
+  return { errorCount, hasGripper };
+}
+
+function buildGripperEvents(lines, lineDelay, sourceOrder) {
+  const events = [];
+  let timeMs = 0;
+
+  for (const line of lines) {
+    if (line.gripperCommands.length > 0) {
+      const tokens = line.gripperCommands.map((cmd) => `g${cmd.angle}`);
+      events.push({ timeMs, tokens, order: sourceOrder + line.index * 0.001 });
+    }
+    timeMs += getWaitMsForLine(line, lineDelay);
+  }
+
+  return events;
+}
+
+function buildGripperScriptFromEvents(events) {
+  if (events.length === 0) return "";
+  const sorted = [...events].sort((a, b) => (a.timeMs === b.timeMs ? a.order - b.order : a.timeMs - b.timeMs));
+  const lines = [];
+  let lastTime = 0;
+  for (const event of sorted) {
+    const delta = Math.max(0, Math.round(event.timeMs - lastTime));
+    if (delta > 0) lines.push(`wait${delta}`);
+    lines.push(event.tokens.join(","));
+    lastTime = event.timeMs;
+  }
+  return lines.join("\n");
 }
 
 function MiniProgress({ value }) {
@@ -241,6 +398,8 @@ function BotPanel({
   commandCount,
   validCount,
   issueCount,
+  gripperOnline,
+  gripperNeeded,
 }) {
   const textareaRef = useRef(null);
 
@@ -345,17 +504,22 @@ function BotPanel({
         <ToolbarButton icon={Download} label="Insert Samples" onClick={insertSample} />
       </div>
 
-      <div className="rounded-2xl border border-slate-200 bg-slate-50 px-4 py-3">
-        <div className="flex items-center justify-between text-xs text-slate-500">
+      <div className="rounded-2xl border border-slate-700 bg-slate-900 px-4 py-3">
+        <div className="flex items-center justify-between text-xs text-slate-300">
           <span className="inline-flex items-center gap-2">
             {bot.online ? <Wifi className="h-3.5 w-3.5 text-emerald-500" /> : <WifiOff className="h-3.5 w-3.5 text-slate-400" />}
             {bot.id} · {statusText}
           </span>
-          <span className="font-mono text-slate-500">poll: {POLL_MS}ms</span>
+          <span className="font-mono text-slate-400">poll: {POLL_MS}ms</span>
         </div>
-        <div className="mt-2 font-mono text-[11px] leading-5 text-slate-700">{bot.angles.map((a, i) => `${i + 1}:${a}`).join("  ")}</div>
-        <div className="mt-1 text-[11px] text-slate-500">
+        <div className="mt-2 font-mono text-[11px] leading-5 text-slate-200">{bot.angles.map((a, i) => `${i + 1}:${a}`).join("  ")}</div>
+        <div className="mt-1 text-[11px] text-slate-400">
           {bot.scriptRunning ? `line ${bot.lineIndex}/${bot.lineCount || 0} · wait ${bot.waitMs}ms` : bot.sending ? "uploading script..." : `last seen: ${bot.lastSeen}`}
+        </div>
+        <div className={`mt-2 inline-flex items-center gap-2 rounded-full px-2.5 py-1 text-[11px] ${gripperOnline ? "bg-emerald-50 text-emerald-700" : "bg-rose-50 text-rose-700"}`}>
+          {gripperOnline ? <Wifi className="h-3 w-3" /> : <WifiOff className="h-3 w-3" />}
+          Gripper {gripperOnline ? "online" : "offline"}
+          {gripperNeeded && !gripperOnline ? " · script blocked" : ""}
         </div>
       </div>
 
@@ -404,6 +568,12 @@ function BotPanel({
                         : `wait ${cmd.ms}ms`}
                     </span>
                   ))}
+                  {line.gripperCommands.map((cmd, i) => (
+                    <span key={`g-${i}`} className="inline-flex items-center gap-2 rounded-full border border-emerald-200 bg-emerald-50 px-3 py-1 text-xs text-emerald-700">
+                      <CircleDot className="h-3.5 w-3.5" />
+                      {`g${cmd.angle}`}
+                    </span>
+                  ))}
                   {line.errors.map((bad, i) => (
                     <span key={i} className="inline-flex items-center gap-2 rounded-full border border-rose-200 bg-rose-50 px-3 py-1 text-xs text-rose-700">
                       <XCircle className="h-3.5 w-3.5" />
@@ -443,6 +613,15 @@ export default function App() {
   const [busy, setBusy] = useState(false);
   const [liveHelp, setLiveHelp] = useState(true);
   const [sentRequests, setSentRequests] = useState(0);
+  const [includeGripperSync, setIncludeGripperSync] = useState(true);
+  const [gripperHost, setGripperHost] = useState(DEFAULT_GRIPPER_HOST);
+  const [gripperAngle, setGripperAngle] = useState(GRIPPER_HOME);
+  const [gripperTarget, setGripperTarget] = useState(GRIPPER_HOME);
+  const [gripperOnline, setGripperOnline] = useState(true);
+  const [gripperMoving, setGripperMoving] = useState(false);
+  const [gripperLastSeen, setGripperLastSeen] = useState("never");
+  const [runError, setRunError] = useState("");
+  const [botLocks, setBotLocks] = useState([1, 4]);
 
   const botsRef = useRef(bots);
   useEffect(() => {
@@ -450,11 +629,20 @@ export default function App() {
   }, [bots]);
 
   const parsed = useMemo(() => bots.map((b) => parseScript(b.script)), [bots]);
+  const parsedMeta = useMemo(() => parsed.map((lines) => getScriptMeta(lines)), [parsed]);
 
   const pushLog = (msg) => setGlobalLog((prev) => [{ time: nowTime(), msg }, ...prev].slice(0, 18));
+  const reportRunError = (msg) => {
+    setRunError(msg);
+    pushLog(msg);
+  };
   const patchBot = (idx, patch) => setBots((prev) => prev.map((b, i) => (i === idx ? { ...b, ...patch } : b)));
   const setSelected = (idx) => setBots((prev) => prev.map((b, i) => ({ ...b, selected: i === idx })));
   const currentAnglesSummary = (bot) => (bot.angles || []).map((a, i) => `${i + 1}:${a}`).join("  ");
+
+  const clampGripper = (value) => clamp(value, GRIPPER_MIN, GRIPPER_MAX);
+  const gripperUrl = (path) => buildEspProxyUrl(gripperHost, path);
+  const setBotLock = (idx, lock) => setBotLocks((prev) => prev.map((v, i) => (i === idx ? lock : v)));
 
   const effectiveDelay = (bot) => {
     const local = Number(bot?.lineDelay);
@@ -523,15 +711,334 @@ export default function App() {
     console.log("SENDING TO:", runUrl, "BODY:", body);
   }
 
+  async function sendScriptBodyToBot(idx, scriptText) {
+    const bot = botsRef.current[idx];
+    if (!bot?.ip) {
+      reportRunError(`${bot?.id || `Bot ${idx + 1}`}: host missing`);
+      return false;
+    }
+
+    const body = toEspScript(scriptText);
+    if (!body.trim()) {
+      reportRunError(`${bot.ip}: empty script`);
+      return false;
+    }
+
+    const delay = effectiveDelay(bot);
+    const setDelayUrl = buildEspProxyUrl(bot.ip, `/setdelay?val=${encodeURIComponent(delay)}`);
+    const runUrl = buildEspProxyUrl(bot.ip, "/run");
+
+    patchBot(idx, { sending: true, lastAction: "script upload", status: "sending" });
+    setSentRequests((n) => n + 1);
+
+    try {
+      await fetchWithTimeout(setDelayUrl, {}, 1200);
+      await fetchWithTimeout(runUrl, {
+        method: "POST",
+        headers: { "Content-Type": "text/plain" },
+        body,
+      }, Math.max(1500, body.length * 15));
+      patchBot(idx, { lastAction: "script uploaded", status: "queued" });
+      return true;
+    } catch {
+      patchBot(idx, { status: "error" });
+      reportRunError(`${bot.ip}: script upload failed`);
+      return false;
+    } finally {
+      patchBot(idx, { sending: false });
+    }
+  }
+
+  async function queueScriptBodyToBot(idx, scriptText) {
+    const bot = botsRef.current[idx];
+    if (!bot?.ip) {
+      reportRunError(`${bot?.id || `Bot ${idx + 1}`}: host missing`);
+      return false;
+    }
+
+    const body = toEspScript(scriptText);
+    if (!body.trim()) {
+      reportRunError(`${bot.ip}: empty script`);
+      return false;
+    }
+
+    const delay = effectiveDelay(bot);
+    const setDelayUrl = buildEspProxyUrl(bot.ip, `/setdelay?val=${encodeURIComponent(delay)}`);
+    const runUrl = buildEspProxyUrl(bot.ip, "/run?mode=queue");
+
+    patchBot(idx, { sending: true, lastAction: "script queued", status: "sending" });
+    setSentRequests((n) => n + 1);
+
+    try {
+      await fetchWithTimeout(setDelayUrl, {}, 1200);
+      await fetchWithTimeout(runUrl, {
+        method: "POST",
+        headers: { "Content-Type": "text/plain" },
+        body,
+      }, Math.max(1500, body.length * 15));
+      patchBot(idx, { lastAction: "queued", status: "queued" });
+      return true;
+    } catch {
+      patchBot(idx, { status: "error" });
+      reportRunError(`${bot.ip}: queue failed`);
+      return false;
+    } finally {
+      patchBot(idx, { sending: false });
+    }
+  }
+
+  async function queueScriptToBot(idx, reverse = false) {
+    const bot = botsRef.current[idx];
+    if (!bot?.ip) {
+      pushLog(`${bot?.id || `Bot ${idx + 1}`}: host missing`);
+      return;
+    }
+
+    const scriptText = reverse ? reverseScriptText(bot.script) : bot.script;
+    const body = toEspScript(scriptText);
+    if (!body.trim()) {
+      pushLog(`${bot.ip}: empty script`);
+      return;
+    }
+
+    const delay = effectiveDelay(bot);
+    const setDelayUrl = buildEspProxyUrl(bot.ip, `/setdelay?val=${encodeURIComponent(delay)}`);
+    const runUrl = buildEspProxyUrl(bot.ip, "/run?mode=queue");
+
+    patchBot(idx, { sending: true, lastAction: reverse ? "reverse queued" : "script queued", status: "sending" });
+    setSentRequests((n) => n + 1);
+    pushLog(`${bot.ip}: queued script (${delay}ms)`);
+
+    try {
+      await fetchWithTimeout(setDelayUrl, {}, 1200);
+      await fetchWithTimeout(runUrl, {
+        method: "POST",
+        headers: { "Content-Type": "text/plain" },
+        body,
+      }, Math.max(1500, body.length * 15));
+      patchBot(idx, { lastAction: "queued", status: "queued" });
+    } catch {
+      patchBot(idx, { status: "error" });
+      pushLog(`${bot.ip}: queue failed`);
+    } finally {
+      patchBot(idx, { sending: false });
+    }
+  }
+
+  async function fetchEspEpochMs(idx) {
+    const bot = botsRef.current[idx];
+    if (!bot?.ip) return null;
+    const url = buildEspProxyUrl(bot.ip, "/time");
+    const res = await fetchWithTimeout(url, {}, 1200);
+    if (!res.ok) return null;
+    const data = await res.json();
+    const value = Number(data?.epochMs);
+    return Number.isFinite(value) ? value : null;
+  }
+
+  async function startBotAt(idx, epochMs) {
+    const bot = botsRef.current[idx];
+    if (!bot?.ip) return;
+    const url = buildEspProxyUrl(bot.ip, `/start?at=${encodeURIComponent(epochMs)}`);
+    await fetchWithTimeout(url, {}, 1200);
+  }
+
+  async function fetchGripperEpochMs() {
+    if (!gripperHost) return null;
+    const url = gripperUrl("/time");
+    const res = await fetchWithTimeout(url, {}, 1200);
+    if (!res.ok) return null;
+    const data = await res.json();
+    const value = Number(data?.epochMs);
+    return Number.isFinite(value) ? value : null;
+  }
+
+  async function queueGripper(angle) {
+    if (!gripperHost) return;
+    const clamped = clampGripper(angle);
+    const url = gripperUrl(`/queue?angle=${encodeURIComponent(clamped)}`);
+    await fetchWithTimeout(url, {}, 1200);
+  }
+
+  async function queueGripperScript(script) {
+    if (!gripperHost) return;
+    if (!script.trim()) return;
+    const url = gripperUrl("/run?mode=queue");
+    await fetchWithTimeout(url, {
+      method: "POST",
+      headers: { "Content-Type": "text/plain" },
+      body: script,
+    }, Math.max(1500, script.length * 15));
+  }
+
+  async function startGripperAt(epochMs) {
+    if (!gripperHost) return;
+    const url = gripperUrl(`/start?at=${encodeURIComponent(epochMs)}`);
+    await fetchWithTimeout(url, {}, 1200);
+  }
+
+  async function sendGripperAngle(angle) {
+    if (!gripperHost) return;
+    const clamped = clampGripper(angle);
+    const url = gripperUrl(`/api?cmd=g${encodeURIComponent(clamped)}`);
+    await fetchWithTimeout(url, {}, 1200);
+    setGripperTarget(clamped);
+  }
+
+  async function runScriptText(idx, scriptText, { requiresGripper = false } = {}) {
+    setRunError("");
+    const lines = parseScript(scriptText);
+    const meta = getScriptMeta(lines);
+    const bot = botsRef.current[idx];
+
+    if (meta.errorCount > 0) {
+      reportRunError(`Bot ${idx + 1}: fix script errors before run`);
+      return false;
+    }
+    if (!bot?.online) {
+      reportRunError(`Bot ${idx + 1} is offline. Bring it online before running.`);
+      return false;
+    }
+    const needsGripper = requiresGripper || meta.hasGripper;
+    if (needsGripper && !gripperOnline) {
+      reportRunError("Gripper offline: remove g-commands or bring gripper online.");
+      return false;
+    }
+
+    patchBot(idx, { script: scriptText });
+
+    if (!meta.hasGripper) {
+      return await sendScriptBodyToBot(idx, scriptText);
+    }
+
+    const gripperEvents = buildGripperEvents(lines, effectiveDelay(bot), idx);
+    const gripperScript = buildGripperScriptFromEvents(gripperEvents);
+    const queued = await queueScriptBodyToBot(idx, scriptText);
+    if (!queued) return false;
+    await queueGripperScript(gripperScript);
+
+    try {
+      const [tb, tg] = await Promise.all([fetchEspEpochMs(idx), fetchGripperEpochMs()]);
+      if (tb == null || tg == null) {
+        reportRunError("Sync start failed: time not available");
+        return false;
+      }
+      const startAt = Math.max(tb, tg) + SYNC_START_BUFFER_MS;
+      await Promise.all([startBotAt(idx, startAt), startGripperAt(startAt)]);
+      pushLog(`Sync start at ${startAt}`);
+      return true;
+    } catch {
+      reportRunError("Sync start failed");
+      return false;
+    }
+  }
+
   async function runScript(idx, reverse = false) {
-    await sendScriptToBot(idx, reverse);
+    const meta = parsedMeta[idx];
+    if (meta.errorCount > 0) {
+      reportRunError(`Bot ${idx + 1}: fix script errors before run`);
+      return;
+    }
+    if (!botsRef.current[idx]?.online) {
+      reportRunError(`Bot ${idx + 1} is offline. Bring it online before running.`);
+      return;
+    }
+    if (meta.hasGripper && !gripperOnline) {
+      reportRunError("Gripper offline: remove g-commands or bring gripper online.");
+      return;
+    }
+    if (!meta.hasGripper) {
+      await sendScriptToBot(idx, reverse);
+      return;
+    }
+
+    const gripperEvents = buildGripperEvents(parsed[idx], effectiveDelay(botsRef.current[idx]), idx);
+    const gripperScript = buildGripperScriptFromEvents(gripperEvents);
+    await queueScriptToBot(idx, reverse);
+    await queueGripperScript(gripperScript);
+
+    try {
+      const [tb, tg] = await Promise.all([fetchEspEpochMs(idx), fetchGripperEpochMs()]);
+      if (tb == null || tg == null) {
+        pushLog("Sync start failed: time not available");
+      } else {
+        const startAt = Math.max(tb, tg) + SYNC_START_BUFFER_MS;
+        await Promise.all([startBotAt(idx, startAt), startGripperAt(startAt)]);
+        pushLog(`Sync start at ${startAt}`);
+      }
+    } catch {
+      pushLog("Sync start failed");
+    }
   }
 
   async function runBothSameTime(reverse = false) {
     setBusy(true);
-    pushLog(`Both bots: ${reverse ? "reverse run" : "run"}`);
-    await Promise.all([sendScriptToBot(0, reverse), sendScriptToBot(1, reverse)]);
+    pushLog(`All units: ${reverse ? "reverse run" : "run"}`);
+    const metaA = parsedMeta[0];
+    const metaB = parsedMeta[1];
+    const anyErrors = metaA.errorCount > 0 || metaB.errorCount > 0;
+    const anyGripper = metaA.hasGripper || metaB.hasGripper;
+    if (anyErrors) {
+      reportRunError("Fix script errors before Run All.");
+      setBusy(false);
+      return;
+    }
+    const bot0Online = botsRef.current[0]?.online;
+    const bot1Online = botsRef.current[1]?.online;
+    if (!bot0Online || !bot1Online) {
+      reportRunError("One or more bots are offline. Bring both online before Run All.");
+      setBusy(false);
+      return;
+    }
+    if (anyGripper && !gripperOnline) {
+      reportRunError("Gripper offline: remove g-commands or bring gripper online.");
+      setBusy(false);
+      return;
+    }
+
+    await Promise.all([queueScriptToBot(0, reverse), queueScriptToBot(1, reverse)]);
+    if (includeGripperSync && anyGripper) {
+      const eventsA = buildGripperEvents(parsed[0], effectiveDelay(botsRef.current[0]), 0);
+      const eventsB = buildGripperEvents(parsed[1], effectiveDelay(botsRef.current[1]), 1);
+      const gripperScript = buildGripperScriptFromEvents([...eventsA, ...eventsB]);
+      await queueGripperScript(gripperScript);
+    }
+
+    try {
+      const timeCalls = [fetchEspEpochMs(0), fetchEspEpochMs(1)];
+      if (includeGripperSync && anyGripper) timeCalls.push(fetchGripperEpochMs());
+      const times = await Promise.all(timeCalls);
+      const [t0, t1, tg] = times;
+      if (t0 == null || t1 == null || (includeGripperSync && anyGripper && tg == null)) {
+        pushLog("Sync start failed: time not available");
+      } else {
+        const startAt = Math.max(t0, t1, includeGripperSync && anyGripper ? tg : 0) + SYNC_START_BUFFER_MS;
+        const startCalls = [startBotAt(0, startAt), startBotAt(1, startAt)];
+        if (includeGripperSync && anyGripper) startCalls.push(startGripperAt(startAt));
+        await Promise.all(startCalls);
+        pushLog(`Sync start at ${startAt}`);
+      }
+    } catch {
+      pushLog("Sync start failed");
+    }
     setBusy(false);
+  }
+
+  async function moveBot(idx, fromLock, toLock, scriptText) {
+    if (botLocks[idx] !== fromLock) {
+      reportRunError(`Bot ${idx + 1} expected at Lock ${fromLock}. Current: Lock ${botLocks[idx]}.`);
+      return;
+    }
+    const ok = await runScriptText(idx, scriptText);
+    if (ok) setBotLock(idx, toLock);
+  }
+
+  async function runGripperDemo() {
+    if (botLocks[0] !== 2) {
+      reportRunError(`Gripper demo requires Bot 1 at Lock 2. Current: Lock ${botLocks[0]}.`);
+      return;
+    }
+    await runScriptText(0, GRIPPER_DEMO_SCRIPT, { requiresGripper: true });
   }
 
   async function homeAll() {
@@ -665,6 +1172,26 @@ export default function App() {
     }
   }
 
+  async function pollGripper() {
+    if (!gripperHost) return;
+    try {
+      const url = gripperUrl("/status");
+      const statusRes = await fetchWithTimeout(url, {}, 1000);
+      if (!statusRes.ok) {
+        setGripperOnline(false);
+        return;
+      }
+      const s = await statusRes.json();
+      const angle = clampGripper(Number(s?.angle) || GRIPPER_HOME);
+      setGripperAngle(angle);
+      setGripperMoving(!!s?.moving);
+      setGripperOnline(true);
+      setGripperLastSeen(nowTime());
+    } catch {
+      setGripperOnline(false);
+    }
+  }
+
   useEffect(() => {
     pollBot(0);
     pollBot(1);
@@ -674,6 +1201,14 @@ export default function App() {
     }, POLL_MS);
     return () => clearInterval(id);
   }, []);
+
+  useEffect(() => {
+    pollGripper();
+    const id = setInterval(() => {
+      pollGripper();
+    }, POLL_MS);
+    return () => clearInterval(id);
+  }, [gripperHost]);
 
   const receivingCount = bots.filter((b) => b.receiving).length;
   const sendingCount = bots.filter((b) => b.sending).length;
@@ -702,14 +1237,26 @@ export default function App() {
             <div className="flex flex-wrap items-center gap-2">
               <div className="rounded-full border border-slate-200 bg-white px-3 py-1.5 text-xs text-slate-700">{globalStatusText}</div>
               <div className="rounded-full border border-slate-200 bg-white px-3 py-1.5 text-xs text-slate-700">Delay default {DEFAULT_LINE_DELAY}ms</div>
-              <ToolbarButton icon={Play} label="Run Both" onClick={() => runBothSameTime(false)} disabled={busy} active />
-              <ToolbarButton icon={RotateCcw} label="Reverse Both" onClick={() => runBothSameTime(true)} disabled={busy} />
+              <button
+                onClick={() => setIncludeGripperSync((v) => !v)}
+                className={`rounded-full border px-3 py-1.5 text-xs transition ${includeGripperSync ? "border-emerald-200 bg-emerald-50 text-emerald-700" : "border-slate-200 bg-white text-slate-600"}`}
+              >
+                {includeGripperSync ? "Gripper sync on" : "Gripper sync off"}
+              </button>
+              <ToolbarButton icon={Play} label="Run All" onClick={() => runBothSameTime(false)} disabled={busy} active />
+              <ToolbarButton icon={RotateCcw} label="Reverse All" onClick={() => runBothSameTime(true)} disabled={busy} />
               <ToolbarButton icon={Home} label="Home All" onClick={homeAll} disabled={busy} />
               <ToolbarButton icon={Layers3} label="Body All" onClick={homeBodyAll} disabled={busy} />
               <ToolbarButton icon={Home} label="Locks All" onClick={homeLocksAll} disabled={busy} />
               <ToolbarButton icon={Square} label="Stop All" onClick={stopAll} disabled={busy} danger />
             </div>
           </div>
+
+          {runError ? (
+            <div className="mt-4 rounded-2xl border border-rose-200 bg-rose-50 px-4 py-3 text-base font-semibold text-rose-700">
+              {runError}
+            </div>
+          ) : null}
 
           <div className="mt-4 grid gap-3 lg:grid-cols-4">
             <StatCard icon={Activity} label="Requests Sent" value={sentRequests} sub="script uploads + direct commands" />
@@ -769,6 +1316,8 @@ export default function App() {
             commandCount={parsed[0].reduce((acc, line) => acc + line.commands.length, 0)}
             validCount={parsed[0].filter((l) => l.isValid).length}
             issueCount={parsed[0].reduce((acc, line) => acc + line.errors.length, 0)}
+            gripperOnline={gripperOnline}
+            gripperNeeded={parsedMeta[0].hasGripper}
           />
 
           <BotPanel
@@ -797,7 +1346,88 @@ export default function App() {
             commandCount={parsed[1].reduce((acc, line) => acc + line.commands.length, 0)}
             validCount={parsed[1].filter((l) => l.isValid).length}
             issueCount={parsed[1].reduce((acc, line) => acc + line.errors.length, 0)}
+            gripperOnline={gripperOnline}
+            gripperNeeded={parsedMeta[1].hasGripper}
           />
+        </div>
+
+        <div className="mt-4 rounded-[28px] border border-slate-200 bg-white p-4 shadow-[0_8px_30px_rgba(15,23,42,0.08)]">
+          <div className="mb-4 flex items-center justify-between">
+            <div>
+              <div className="text-lg font-semibold text-slate-900">Gripper Module</div>
+              <div className="text-sm text-slate-500">Manual control + optional sync with Run All.</div>
+            </div>
+            <div className={`inline-flex items-center gap-2 rounded-full px-2.5 py-1 text-xs font-semibold ${gripperOnline ? "bg-emerald-50 text-emerald-700" : "bg-slate-100 text-slate-500"}`}>
+              {gripperOnline ? <Wifi className="h-3.5 w-3.5" /> : <WifiOff className="h-3.5 w-3.5" />}
+              {gripperOnline ? "ONLINE" : "OFFLINE"}
+            </div>
+          </div>
+          <div className="grid gap-4 lg:grid-cols-[1.1fr_0.9fr]">
+            <div className="rounded-3xl border border-slate-800 bg-slate-900 p-4">
+              <div className="text-sm font-medium text-slate-200">Gripper Host / IP</div>
+              <input
+                value={gripperHost}
+                onChange={(e) => setGripperHost(e.target.value.trim())}
+                placeholder="gripper.local or 10.0.0.201"
+                className="mt-2 w-full rounded-2xl border border-slate-700 bg-slate-800 px-4 py-3 text-sm text-slate-100 outline-none focus:border-sky-300"
+              />
+              <div className="mt-4">
+                <div className="text-xs text-slate-400">Angle</div>
+                <input
+                  type="range"
+                  min={GRIPPER_MIN}
+                  max={GRIPPER_MAX}
+                  value={gripperTarget}
+                  onChange={(e) => {
+                    const value = Number(e.target.value);
+                    setGripperTarget(value);
+                    sendGripperAngle(value);
+                  }}
+                  className="mt-2 w-full"
+                />
+                <div className="mt-2 flex items-center gap-2">
+                  <input
+                    type="number"
+                    min={GRIPPER_MIN}
+                    max={GRIPPER_MAX}
+                    value={gripperTarget}
+                    onChange={(e) => {
+                      const value = Number(e.target.value);
+                      setGripperTarget(value);
+                      sendGripperAngle(value);
+                    }}
+                    className="w-24 rounded-2xl border border-slate-700 bg-slate-800 px-3 py-2 text-sm text-slate-100 outline-none focus:border-sky-300"
+                  />
+                  <button
+                    onClick={() => sendGripperAngle(GRIPPER_HOME)}
+                    className="rounded-2xl border border-slate-700 bg-slate-800 px-4 py-2 text-sm text-slate-100 shadow-sm"
+                  >
+                    Home
+                  </button>
+                </div>
+              </div>
+            </div>
+            <div className="rounded-3xl border border-slate-800 bg-slate-900 p-4">
+              <div className="text-sm font-medium text-slate-200">Sync Status</div>
+              <div className="mt-2 text-sm text-slate-300">Current: {gripperAngle}°</div>
+              <div className="mt-1 text-sm text-slate-300">Target: {gripperTarget}°</div>
+              <div className="mt-1 text-xs text-slate-400">{gripperMoving ? "Moving" : "Idle"} · last seen {gripperLastSeen}</div>
+              <div className="mt-4 flex flex-wrap gap-2">
+                <button
+                  onClick={() => queueGripper(gripperTarget)}
+                  className="rounded-2xl border border-slate-700 bg-slate-800 px-4 py-2 text-sm text-slate-100 shadow-sm"
+                >
+                  Queue For Sync
+                </button>
+                <button
+                  onClick={() => setIncludeGripperSync(true)}
+                  className="rounded-2xl border border-emerald-400/40 bg-emerald-500/10 px-4 py-2 text-sm text-emerald-200 shadow-sm"
+                >
+                  Enable Sync
+                </button>
+              </div>
+            </div>
+          </div>
         </div>
 
         <div className="mt-4 rounded-[28px] border border-slate-200 bg-white p-4 shadow-[0_8px_30px_rgba(15,23,42,0.08)]">
@@ -816,7 +1446,7 @@ export default function App() {
               <button onClick={exportScripts} className="rounded-2xl border border-slate-200 bg-white px-4 py-2.5 text-sm text-slate-700 shadow-sm">
                 <Download className="mr-2 inline-block h-4 w-4" />Export
               </button>
-              <button onClick={() => setGlobalLineDelay(1000)} className="rounded-2xl border border-slate-200 bg-white px-4 py-2.5 text-sm text-slate-700 shadow-sm">
+              <button onClick={() => setGlobalLineDelay(0)} className="rounded-2xl border border-slate-200 bg-white px-4 py-2.5 text-sm text-slate-700 shadow-sm">
                 Reset Delay
               </button>
               <button onClick={() => patchBot(0, { script: DEFAULT_SCRIPT, lastAction: "reset" })} className="rounded-2xl border border-slate-200 bg-white px-4 py-2.5 text-sm text-slate-700 shadow-sm">
@@ -883,6 +1513,91 @@ export default function App() {
               )}
             </div>
           </div>
+        </div>
+
+        <div className="mt-4 rounded-[28px] border border-slate-200 bg-white p-4 shadow-[0_8px_30px_rgba(15,23,42,0.08)]">
+          <div className="mb-4 flex items-center justify-between">
+            <div>
+              <div className="text-lg font-semibold text-slate-900">Lock Moves</div>
+              <div className="text-sm text-slate-500">Preset moves between cardboard locks.</div>
+            </div>
+          </div>
+          <div className="grid gap-4 lg:grid-cols-2">
+            <div className="rounded-3xl border border-slate-800 bg-slate-900 p-4">
+              <div className="text-sm font-semibold text-slate-100">Bot 1 (Lock {botLocks[0]})</div>
+              <div className="mt-2 flex items-center gap-2 text-sm text-slate-300">
+                <span>Set lock:</span>
+                <select
+                  value={botLocks[0]}
+                  onChange={(e) => setBotLock(0, Number(e.target.value))}
+                  className="rounded-2xl border border-slate-700 bg-slate-800 px-3 py-2 text-sm text-slate-100"
+                >
+                  {[1, 2, 3, 4].map((lock) => (
+                    <option key={lock} value={lock}>Lock {lock}</option>
+                  ))}
+                </select>
+              </div>
+              <div className="mt-4 grid gap-3">
+                <button
+                  onClick={() => moveBot(0, 1, 2, BOT1_LOCK_1_TO_2)}
+                  className="rounded-3xl border border-slate-700 bg-slate-800 px-5 py-4 text-base font-semibold text-slate-100 shadow-sm"
+                >
+                  Move Bot 1: Lock 1 → Lock 2
+                </button>
+                <button
+                  onClick={() => moveBot(0, 2, 1, BOT1_LOCK_2_TO_1)}
+                  className="rounded-3xl border border-slate-700 bg-slate-800 px-5 py-4 text-base font-semibold text-slate-100 shadow-sm"
+                >
+                  Move Bot 1: Lock 2 → Lock 1
+                </button>
+              </div>
+            </div>
+
+            <div className="rounded-3xl border border-slate-800 bg-slate-900 p-4">
+              <div className="text-sm font-semibold text-slate-100">Bot 2 (Lock {botLocks[1]})</div>
+              <div className="mt-2 flex items-center gap-2 text-sm text-slate-300">
+                <span>Set lock:</span>
+                <select
+                  value={botLocks[1]}
+                  onChange={(e) => setBotLock(1, Number(e.target.value))}
+                  className="rounded-2xl border border-slate-700 bg-slate-800 px-3 py-2 text-sm text-slate-100"
+                >
+                  {[1, 2, 3, 4].map((lock) => (
+                    <option key={lock} value={lock}>Lock {lock}</option>
+                  ))}
+                </select>
+              </div>
+              <div className="mt-4 grid gap-3">
+                <button
+                  onClick={() => moveBot(1, 4, 3, BOT2_LOCK_4_TO_3)}
+                  className="rounded-3xl border border-slate-700 bg-slate-800 px-5 py-4 text-base font-semibold text-slate-100 shadow-sm"
+                >
+                  Move Bot 2: Lock 4 → Lock 3
+                </button>
+                <button
+                  onClick={() => moveBot(1, 3, 4, BOT2_LOCK_3_TO_4)}
+                  className="rounded-3xl border border-slate-700 bg-slate-800 px-5 py-4 text-base font-semibold text-slate-100 shadow-sm"
+                >
+                  Move Bot 2: Lock 3 → Lock 4
+                </button>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <div className="mt-4 rounded-[28px] border border-slate-200 bg-white p-4 shadow-[0_8px_30px_rgba(15,23,42,0.08)]">
+          <div className="mb-4 flex items-center justify-between">
+            <div>
+              <div className="text-lg font-semibold text-slate-900">Gripper Demo</div>
+              <div className="text-sm text-slate-500">Requires Bot 1 at Lock 2 and gripper online.</div>
+            </div>
+          </div>
+          <button
+            onClick={runGripperDemo}
+            className="w-full rounded-[26px] border border-slate-200 bg-white px-6 py-5 text-lg font-semibold text-slate-900 shadow-sm"
+          >
+            Run Gripper Demo (Bot 1 + Gripper)
+          </button>
         </div>
       </div>
     </div>
