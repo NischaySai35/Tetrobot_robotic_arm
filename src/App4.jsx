@@ -28,15 +28,19 @@ const DEFAULT_SCRIPT = `1s30
 1s60
 5s45,6s45
 4s120`;
-const POLL_MS = 500;
+const POLL_MS = 1000;
+// How long to consider a device "online" since last successful poll (ms)
+const ONLINE_THRESHOLD_MS = 8000;
 const DEFAULT_LINE_DELAY = 0;
 const DEFAULT_HOSTS = ["microbot1.local", "microbot2.local"];
 const DEFAULT_GRIPPER_HOST = "gripper.local";
+const DEFAULT_LASER_HOST = "lazer.local";
 const ESP_PROXY_PATH = "/esp-proxy";
 const SYNC_START_BUFFER_MS = 1500;
 const GRIPPER_MIN = 20;
 const GRIPPER_MAX = 95;
 const GRIPPER_HOME = 90;
+const LASER_MODES = ["off", "on", "blink"];
 
 const BOT1_LOCK_1_TO_2 = `homebody
 wait1000
@@ -127,6 +131,127 @@ wait3000
 wait600
 2s40,3s30`;
 
+const LASER_DEMO_SCRIPT = `homebody
+wait1000
+5s135
+wait3000
+3s127
+wait200
+2s186,1s3
+wait3000
+1s3,2s176,3s140
+wait2000
+4s135
+wait2000
+3s127
+wait200
+2s186,1s3
+lazon
+wait2000
+7s40
+wait2000
+2s170,3s114
+wait2000
+7s140
+wait3000
+2s186
+wait1000
+lazblink
+6s0
+wait2000
+7s90
+wait2000
+6s90
+wait2000
+3s127
+wait1600
+1s3,2s176,3s140
+wait2000
+4s90
+lazoff
+wait2000
+3s127
+wait200
+2s186,1s3
+wait2000
+homebody`;
+
+const IMPORTANT_BOT1_SCRIPT = `homebody
+wait1000
+4s45,6s0
+wait3000
+1s80,2s76,3s11
+wait3000
+1s80,2s58,3s28
+wait2000
+5s45
+wait1000
+1s80
+wait2000
+1s90
+wait2000
+1s140
+wait4000
+6s90
+wait3000
+6s90
+wait4000
+6s180
+wait3000
+6s180
+wait3000
+6s2
+wait7000
+1s90
+wait3000
+1s80
+wait2000
+1s80
+wait1500
+5s90
+wait3000
+1s80,2s76,3s11
+wait2500
+homebody`;
+
+const IMPORTANT_BOT2_SCRIPT = `homebody
+wait1000
+5s45,6s5,7s173
+wait3000
+1s14,2s148,3s90
+wait3000
+1s28,2s166,3s90
+wait2000
+4s135
+wait1000
+5s90
+wait2000
+1s34
+wait2000
+1s34
+wait4000
+1s34
+wait3000
+1s84
+wait4000
+1s84
+wait3000
+1s34
+wait3000
+1s34
+wait7000
+1s32
+wait3000
+1s28
+wait2000
+5s45
+wait1500
+4s90
+wait3000
+1s14,2s148,3s90
+wait2500
+homebody`;
+
 const clamp = (v, min, max) => Math.max(min, Math.min(max, v));
 const nowTime = () => new Date().toLocaleTimeString();
 const OFFLINE_AFTER_FAILURES = 2;
@@ -163,6 +288,15 @@ function parseGripperCommand(token) {
   return { type: "gripper", angle };
 }
 
+function parseLaserCommand(token) {
+  const t = token.trim().toLowerCase();
+  if (!t) return null;
+  if (t === "lazon") return { type: "laser", mode: "on" };
+  if (t === "lazoff") return { type: "laser", mode: "off" };
+  if (t === "lazblink") return { type: "laser", mode: "blink" };
+  return null;
+}
+
 function parseScript(script) {
   const lines = script
     .split(/\r?\n/)
@@ -173,6 +307,7 @@ function parseScript(script) {
     const tokens = line.split(",").map((s) => s.trim()).filter(Boolean);
     const commands = [];
     const gripperCommands = [];
+    const laserCommands = [];
     const errors = [];
 
     for (const token of tokens) {
@@ -186,6 +321,11 @@ function parseScript(script) {
         gripperCommands.push(parsedGripper);
         continue;
       }
+      const parsedLaser = parseLaserCommand(token);
+      if (parsedLaser) {
+        laserCommands.push(parsedLaser);
+        continue;
+      }
       errors.push(token);
     }
 
@@ -194,6 +334,7 @@ function parseScript(script) {
       raw: line,
       commands,
       gripperCommands,
+      laserCommands,
       errors,
       isValid: errors.length === 0,
     };
@@ -234,7 +375,9 @@ function toEspScript(script) {
           const parsed = parseBotCommand(token);
           if (parsed) return commandToEspToken(parsed);
           const parsedGripper = parseGripperCommand(token);
-          return parsedGripper ? "" : token;
+          if (parsedGripper) return "";
+          const parsedLaser = parseLaserCommand(token);
+          return parsedLaser ? "" : token;
         })
         .filter((token) => token.length > 0)
         .join(",")
@@ -250,7 +393,8 @@ function getWaitMsForLine(line, fallbackDelay) {
 function getScriptMeta(lines) {
   const errorCount = lines.reduce((acc, line) => acc + line.errors.length, 0);
   const hasGripper = lines.some((line) => line.gripperCommands.length > 0);
-  return { errorCount, hasGripper };
+  const hasLaser = lines.some((line) => line.laserCommands.length > 0);
+  return { errorCount, hasGripper, hasLaser };
 }
 
 function buildGripperEvents(lines, lineDelay, sourceOrder) {
@@ -266,6 +410,35 @@ function buildGripperEvents(lines, lineDelay, sourceOrder) {
   }
 
   return events;
+}
+
+function buildLaserEvents(lines, lineDelay, sourceOrder) {
+  const events = [];
+  let timeMs = 0;
+
+  for (const line of lines) {
+    if (line.laserCommands.length > 0) {
+      const tokens = line.laserCommands.map((cmd) => (cmd.mode === "on" ? "lazon" : cmd.mode === "blink" ? "lazblink" : "lazoff"));
+      events.push({ timeMs, tokens, order: sourceOrder + line.index * 0.001 });
+    }
+    timeMs += getWaitMsForLine(line, lineDelay);
+  }
+
+  return events;
+}
+
+function buildLaserScriptFromEvents(events) {
+  if (events.length === 0) return "";
+  const sorted = [...events].sort((a, b) => (a.timeMs === b.timeMs ? a.order - b.order : a.timeMs - b.timeMs));
+  const lines = [];
+  let lastTime = 0;
+  for (const event of sorted) {
+    const delta = Math.max(0, Math.round(event.timeMs - lastTime));
+    if (delta > 0) lines.push(`wait${delta}`);
+    lines.push(event.tokens.join(","));
+    lastTime = event.timeMs;
+  }
+  return lines.join("\n");
 }
 
 function buildGripperScriptFromEvents(events) {
@@ -311,7 +484,7 @@ function ToolbarButton({ icon: Icon, label, onClick, active, danger, disabled })
     <button
       onClick={onClick}
       disabled={disabled}
-      className={`inline-flex items-center gap-2 rounded-2xl border px-4 py-2.5 text-sm font-medium transition-all disabled:cursor-not-allowed disabled:opacity-40 ${
+      className={`inline-flex items-center gap-2 rounded-2xl border px-4 py-2.5 text-sm font-medium transition-all duration-200 hover:-translate-y-0.5 hover:shadow-md active:translate-y-0 active:scale-[0.98] disabled:cursor-not-allowed disabled:opacity-40 ${
         danger
           ? "border-rose-200 bg-rose-50 text-rose-700 hover:bg-rose-100"
           : active
@@ -365,6 +538,7 @@ function makeBot(index) {
     lastAction: "idle",
     status: "ready",
     lastSeen: "never",
+    lastSeenMs: 0,
     pollFailures: 0,
     pollInFlight: false,
     angles: [83, 83, 86, 90, 90, 90, 90],
@@ -400,6 +574,8 @@ function BotPanel({
   issueCount,
   gripperOnline,
   gripperNeeded,
+  laserOnline,
+  laserNeeded,
 }) {
   const textareaRef = useRef(null);
 
@@ -521,6 +697,11 @@ function BotPanel({
           Gripper {gripperOnline ? "online" : "offline"}
           {gripperNeeded && !gripperOnline ? " · script blocked" : ""}
         </div>
+        <div className={`mt-2 inline-flex items-center gap-2 rounded-full px-2.5 py-1 text-[11px] ${laserOnline ? "bg-amber-50 text-amber-700" : "bg-rose-50 text-rose-700"}`}>
+          {laserOnline ? <Wifi className="h-3 w-3" /> : <WifiOff className="h-3 w-3" />}
+          Laser {laserOnline ? "online" : "offline"}
+          {laserNeeded && !laserOnline ? " · script blocked" : ""}
+        </div>
       </div>
 
       <div className="mt-4 overflow-hidden rounded-[28px] border-2 border-cyan-500 bg-gradient-to-br from-slate-900 via-slate-800 to-slate-700">
@@ -574,6 +755,12 @@ function BotPanel({
                       {`g${cmd.angle}`}
                     </span>
                   ))}
+                  {line.laserCommands.map((cmd, i) => (
+                    <span key={`l-${i}`} className="inline-flex items-center gap-2 rounded-full border border-amber-200 bg-amber-50 px-3 py-1 text-xs text-amber-700">
+                      <CircleDot className="h-3.5 w-3.5" />
+                      {cmd.mode === "on" ? "lazon" : cmd.mode === "blink" ? "lazblink" : "lazoff"}
+                    </span>
+                  ))}
                   {line.errors.map((bad, i) => (
                     <span key={i} className="inline-flex items-center gap-2 rounded-full border border-rose-200 bg-rose-50 px-3 py-1 text-xs text-rose-700">
                       <XCircle className="h-3.5 w-3.5" />
@@ -590,7 +777,7 @@ function BotPanel({
   );
 }
 
-function fetchWithTimeout(url, options = {}, timeoutMs = 1000) {
+function fetchWithTimeout(url, options = {}, timeoutMs = 2000) {
   const controller = new AbortController();
   const timer = setTimeout(() => {
     console.log(`[Fetch] Timeout after ${timeoutMs}ms for: ${url}`);
@@ -603,6 +790,14 @@ function buildEspProxyUrl(host, path) {
   const url = new URL(ESP_PROXY_PATH, window.location.origin);
   url.searchParams.set("host", host);
   url.searchParams.set("path", path);
+  try {
+    const cached = resolvedIpCacheRef.current?.[host];
+    if (cached && typeof cached === "string" && cached.match(/^\d+\.\d+\.\d+\.\d+$/)) {
+      url.searchParams.set("hostIp", cached);
+    }
+  } catch (e) {
+    // ignore
+  }
   return url.toString();
 }
 
@@ -614,13 +809,24 @@ export default function App() {
   const [liveHelp, setLiveHelp] = useState(true);
   const [sentRequests, setSentRequests] = useState(0);
   const [includeGripperSync, setIncludeGripperSync] = useState(true);
+  const [includeLaserSync, setIncludeLaserSync] = useState(true);
   const [gripperHost, setGripperHost] = useState(DEFAULT_GRIPPER_HOST);
   const [gripperAngle, setGripperAngle] = useState(GRIPPER_HOME);
   const [gripperTarget, setGripperTarget] = useState(GRIPPER_HOME);
   const [gripperOnline, setGripperOnline] = useState(true);
   const [gripperMoving, setGripperMoving] = useState(false);
   const [gripperLastSeen, setGripperLastSeen] = useState("never");
+  const [gripperLastSeenMs, setGripperLastSeenMs] = useState(0);
+  const [laserHost, setLaserHost] = useState(DEFAULT_LASER_HOST);
+  const [laserMode, setLaserMode] = useState("off");
+  const [laserOnline, setLaserOnline] = useState(true);
+  const [laserLastSeen, setLaserLastSeen] = useState("never");
+  const [laserLastSeenMs, setLaserLastSeenMs] = useState(0);
+  const [forceLaserDemoAssumptions, setForceLaserDemoAssumptions] = useState(true);
+  const [forceImportantDemoAssumptions, setForceImportantDemoAssumptions] = useState(true);
   const [runError, setRunError] = useState("");
+  const [activeErrorScope, setActiveErrorScope] = useState("global");
+  const [scopedErrors, setScopedErrors] = useState({});
   const [botLocks, setBotLocks] = useState([1, 4]);
 
   const botsRef = useRef(bots);
@@ -628,13 +834,23 @@ export default function App() {
     botsRef.current = bots;
   }, [bots]);
 
+  // Cache of resolved IPs returned by dev-server proxy (host -> ip)
+  const resolvedIpCacheRef = useRef({});
+
   const parsed = useMemo(() => bots.map((b) => parseScript(b.script)), [bots]);
   const parsedMeta = useMemo(() => parsed.map((lines) => getScriptMeta(lines)), [parsed]);
 
   const pushLog = (msg) => setGlobalLog((prev) => [{ time: nowTime(), msg }, ...prev].slice(0, 18));
   const reportRunError = (msg) => {
     setRunError(msg);
+    setScopedErrors((prev) => ({ ...prev, [activeErrorScope]: msg }));
     pushLog(msg);
+  };
+  const triggerAction = (scope, action) => {
+    setActiveErrorScope(scope);
+    setRunError("");
+    setScopedErrors((prev) => ({ ...prev, [scope]: "" }));
+    return action();
   };
   const patchBot = (idx, patch) => setBots((prev) => prev.map((b, i) => (i === idx ? { ...b, ...patch } : b)));
   const setSelected = (idx) => setBots((prev) => prev.map((b, i) => ({ ...b, selected: i === idx })));
@@ -642,6 +858,7 @@ export default function App() {
 
   const clampGripper = (value) => clamp(value, GRIPPER_MIN, GRIPPER_MAX);
   const gripperUrl = (path) => buildEspProxyUrl(gripperHost, path);
+  const laserUrl = (path) => buildEspProxyUrl(laserHost, path);
   const setBotLock = (idx, lock) => setBotLocks((prev) => prev.map((v, i) => (i === idx ? lock : v)));
 
   const effectiveDelay = (bot) => {
@@ -877,6 +1094,16 @@ export default function App() {
     await fetchWithTimeout(url, {}, 1200);
   }
 
+  async function fetchLaserEpochMs() {
+    if (!laserHost) return null;
+    const url = laserUrl("/time");
+    const res = await fetchWithTimeout(url, {}, 1200);
+    if (!res.ok) return null;
+    const data = await res.json();
+    const value = Number(data?.epochMs);
+    return Number.isFinite(value) ? value : null;
+  }
+
   async function sendGripperAngle(angle) {
     if (!gripperHost) return;
     const clamped = clampGripper(angle);
@@ -885,7 +1112,37 @@ export default function App() {
     setGripperTarget(clamped);
   }
 
-  async function runScriptText(idx, scriptText, { requiresGripper = false } = {}) {
+  async function queueLaserScript(script) {
+    if (!laserHost) return;
+    if (!script.trim()) return;
+    const url = laserUrl("/run?mode=queue");
+    await fetchWithTimeout(url, {
+      method: "POST",
+      headers: { "Content-Type": "text/plain" },
+      body: script,
+    }, Math.max(1500, script.length * 15));
+  }
+
+  async function startLaserAt(epochMs) {
+    if (!laserHost) return;
+    const url = laserUrl(`/start?at=${encodeURIComponent(epochMs)}`);
+    await fetchWithTimeout(url, {}, 1200);
+  }
+
+  async function sendLaserMode(mode) {
+    if (!laserHost) return;
+    const nextMode = LASER_MODES.includes(mode) ? mode : "off";
+    const path = nextMode === "on" ? "/lazon" : nextMode === "blink" ? "/lazblink" : "/lazoff";
+    const url = laserUrl(path);
+    await fetchWithTimeout(url, {}, 1200);
+    setLaserMode(nextMode);
+  }
+
+  async function runScriptText(
+    idx,
+    scriptText,
+    { requiresGripper = false, requiresLaser = false, allowBotOffline = false, allowLaserOffline = false } = {}
+  ) {
     setRunError("");
     const lines = parseScript(scriptText);
     const meta = getScriptMeta(lines);
@@ -895,7 +1152,7 @@ export default function App() {
       reportRunError(`Bot ${idx + 1}: fix script errors before run`);
       return false;
     }
-    if (!bot?.online) {
+    if (!bot?.online && !allowBotOffline) {
       reportRunError(`Bot ${idx + 1} is offline. Bring it online before running.`);
       return false;
     }
@@ -904,27 +1161,44 @@ export default function App() {
       reportRunError("Gripper offline: remove g-commands or bring gripper online.");
       return false;
     }
+    const needsLaser = requiresLaser || meta.hasLaser;
+    if (needsLaser && !laserOnline && !allowLaserOffline) {
+      reportRunError("Laser offline: remove l-commands or bring laser online.");
+      return false;
+    }
 
     patchBot(idx, { script: scriptText });
 
-    if (!meta.hasGripper) {
+    if (!meta.hasGripper && !meta.hasLaser) {
       return await sendScriptBodyToBot(idx, scriptText);
     }
 
-    const gripperEvents = buildGripperEvents(lines, effectiveDelay(bot), idx);
+    const gripperEvents = meta.hasGripper ? buildGripperEvents(lines, effectiveDelay(bot), idx) : [];
     const gripperScript = buildGripperScriptFromEvents(gripperEvents);
+    const laserEvents = meta.hasLaser ? buildLaserEvents(lines, effectiveDelay(bot), idx) : [];
+    const laserScript = buildLaserScriptFromEvents(laserEvents);
     const queued = await queueScriptBodyToBot(idx, scriptText);
     if (!queued) return false;
-    await queueGripperScript(gripperScript);
+    if (meta.hasGripper) await queueGripperScript(gripperScript);
+    if (meta.hasLaser) await queueLaserScript(laserScript);
 
     try {
-      const [tb, tg] = await Promise.all([fetchEspEpochMs(idx), fetchGripperEpochMs()]);
-      if (tb == null || tg == null) {
+      const timeCalls = [fetchEspEpochMs(idx)];
+      if (meta.hasGripper) timeCalls.push(fetchGripperEpochMs());
+      if (meta.hasLaser) timeCalls.push(fetchLaserEpochMs());
+      const times = await Promise.all(timeCalls);
+      const tb = times[0];
+      const tg = meta.hasGripper ? times[1] : null;
+      const tl = meta.hasLaser ? times[times.length - 1] : null;
+      if (tb == null || (meta.hasGripper && tg == null) || (meta.hasLaser && tl == null)) {
         reportRunError("Sync start failed: time not available");
         return false;
       }
-      const startAt = Math.max(tb, tg) + SYNC_START_BUFFER_MS;
-      await Promise.all([startBotAt(idx, startAt), startGripperAt(startAt)]);
+      const startAt = Math.max(tb, meta.hasGripper ? tg : 0, meta.hasLaser ? tl : 0) + SYNC_START_BUFFER_MS;
+      const startCalls = [startBotAt(idx, startAt)];
+      if (meta.hasGripper) startCalls.push(startGripperAt(startAt));
+      if (meta.hasLaser) startCalls.push(startLaserAt(startAt));
+      await Promise.all(startCalls);
       pushLog(`Sync start at ${startAt}`);
       return true;
     } catch {
@@ -947,23 +1221,39 @@ export default function App() {
       reportRunError("Gripper offline: remove g-commands or bring gripper online.");
       return;
     }
-    if (!meta.hasGripper) {
+    if (meta.hasLaser && !laserOnline) {
+      reportRunError("Laser offline: remove l-commands or bring laser online.");
+      return;
+    }
+    if (!meta.hasGripper && !meta.hasLaser) {
       await sendScriptToBot(idx, reverse);
       return;
     }
 
-    const gripperEvents = buildGripperEvents(parsed[idx], effectiveDelay(botsRef.current[idx]), idx);
+    const gripperEvents = meta.hasGripper ? buildGripperEvents(parsed[idx], effectiveDelay(botsRef.current[idx]), idx) : [];
     const gripperScript = buildGripperScriptFromEvents(gripperEvents);
+    const laserEvents = meta.hasLaser ? buildLaserEvents(parsed[idx], effectiveDelay(botsRef.current[idx]), idx) : [];
+    const laserScript = buildLaserScriptFromEvents(laserEvents);
     await queueScriptToBot(idx, reverse);
-    await queueGripperScript(gripperScript);
+    if (meta.hasGripper) await queueGripperScript(gripperScript);
+    if (meta.hasLaser) await queueLaserScript(laserScript);
 
     try {
-      const [tb, tg] = await Promise.all([fetchEspEpochMs(idx), fetchGripperEpochMs()]);
-      if (tb == null || tg == null) {
+      const timeCalls = [fetchEspEpochMs(idx)];
+      if (meta.hasGripper) timeCalls.push(fetchGripperEpochMs());
+      if (meta.hasLaser) timeCalls.push(fetchLaserEpochMs());
+      const times = await Promise.all(timeCalls);
+      const tb = times[0];
+      const tg = meta.hasGripper ? times[1] : null;
+      const tl = meta.hasLaser ? times[times.length - 1] : null;
+      if (tb == null || (meta.hasGripper && tg == null) || (meta.hasLaser && tl == null)) {
         pushLog("Sync start failed: time not available");
       } else {
-        const startAt = Math.max(tb, tg) + SYNC_START_BUFFER_MS;
-        await Promise.all([startBotAt(idx, startAt), startGripperAt(startAt)]);
+        const startAt = Math.max(tb, meta.hasGripper ? tg : 0, meta.hasLaser ? tl : 0) + SYNC_START_BUFFER_MS;
+        const startCalls = [startBotAt(idx, startAt)];
+        if (meta.hasGripper) startCalls.push(startGripperAt(startAt));
+        if (meta.hasLaser) startCalls.push(startLaserAt(startAt));
+        await Promise.all(startCalls);
         pushLog(`Sync start at ${startAt}`);
       }
     } catch {
@@ -978,6 +1268,7 @@ export default function App() {
     const metaB = parsedMeta[1];
     const anyErrors = metaA.errorCount > 0 || metaB.errorCount > 0;
     const anyGripper = metaA.hasGripper || metaB.hasGripper;
+    const anyLaser = metaA.hasLaser || metaB.hasLaser;
     if (anyErrors) {
       reportRunError("Fix script errors before Run All.");
       setBusy(false);
@@ -995,6 +1286,11 @@ export default function App() {
       setBusy(false);
       return;
     }
+    if (anyLaser && !laserOnline) {
+      reportRunError("Laser offline: remove l-commands or bring laser online.");
+      setBusy(false);
+      return;
+    }
 
     await Promise.all([queueScriptToBot(0, reverse), queueScriptToBot(1, reverse)]);
     if (includeGripperSync && anyGripper) {
@@ -1003,18 +1299,28 @@ export default function App() {
       const gripperScript = buildGripperScriptFromEvents([...eventsA, ...eventsB]);
       await queueGripperScript(gripperScript);
     }
+    if (includeLaserSync && anyLaser) {
+      const eventsA = buildLaserEvents(parsed[0], effectiveDelay(botsRef.current[0]), 0);
+      const eventsB = buildLaserEvents(parsed[1], effectiveDelay(botsRef.current[1]), 1);
+      const laserScript = buildLaserScriptFromEvents([...eventsA, ...eventsB]);
+      await queueLaserScript(laserScript);
+    }
 
     try {
       const timeCalls = [fetchEspEpochMs(0), fetchEspEpochMs(1)];
       if (includeGripperSync && anyGripper) timeCalls.push(fetchGripperEpochMs());
+      if (includeLaserSync && anyLaser) timeCalls.push(fetchLaserEpochMs());
       const times = await Promise.all(timeCalls);
-      const [t0, t1, tg] = times;
-      if (t0 == null || t1 == null || (includeGripperSync && anyGripper && tg == null)) {
+      const [t0, t1] = times;
+      const tg = includeGripperSync && anyGripper ? times[2] : null;
+      const tl = includeLaserSync && anyLaser ? times[times.length - 1] : null;
+      if (t0 == null || t1 == null || (includeGripperSync && anyGripper && tg == null) || (includeLaserSync && anyLaser && tl == null)) {
         pushLog("Sync start failed: time not available");
       } else {
-        const startAt = Math.max(t0, t1, includeGripperSync && anyGripper ? tg : 0) + SYNC_START_BUFFER_MS;
+        const startAt = Math.max(t0, t1, includeGripperSync && anyGripper ? tg : 0, includeLaserSync && anyLaser ? tl : 0) + SYNC_START_BUFFER_MS;
         const startCalls = [startBotAt(0, startAt), startBotAt(1, startAt)];
         if (includeGripperSync && anyGripper) startCalls.push(startGripperAt(startAt));
+        if (includeLaserSync && anyLaser) startCalls.push(startLaserAt(startAt));
         await Promise.all(startCalls);
         pushLog(`Sync start at ${startAt}`);
       }
@@ -1036,9 +1342,107 @@ export default function App() {
   async function runGripperDemo() {
     if (botLocks[0] !== 2) {
       reportRunError(`Gripper demo requires Bot 1 at Lock 2. Current: Lock ${botLocks[0]}.`);
-      return;
+      return false;
     }
-    await runScriptText(0, GRIPPER_DEMO_SCRIPT, { requiresGripper: true });
+    return await runScriptText(0, GRIPPER_DEMO_SCRIPT, { requiresGripper: true });
+  }
+
+  async function runLaserDemo() {
+    const bot2Lock = botLocks[1];
+    const shouldForce = forceLaserDemoAssumptions;
+
+    if (!botsRef.current[1]?.online && !shouldForce) {
+      reportRunError("Laser demo requires Bot 2 online.");
+      return false;
+    }
+    if (!laserOnline && !shouldForce) {
+      reportRunError("Laser demo requires lazer online.");
+      return false;
+    }
+    if (bot2Lock !== 4) {
+      if (!shouldForce) {
+        reportRunError(`Laser demo requires Bot 2 at Lock 4. Current: Lock ${bot2Lock}.`);
+        return false;
+      }
+      setBotLock(1, 4);
+      pushLog("Laser demo: forced Bot 2 to Lock 4");
+    }
+
+    if (!botsRef.current[1]?.online && shouldForce) {
+      pushLog("Laser demo: forcing Bot 2 online assumption");
+    }
+    if (!laserOnline && shouldForce) {
+      pushLog("Laser demo: forcing laser online assumption");
+    }
+
+    return await runScriptText(1, LASER_DEMO_SCRIPT, {
+      requiresLaser: true,
+      allowBotOffline: shouldForce,
+      allowLaserOffline: shouldForce,
+    });
+  }
+
+  async function runImportantDualDemo() {
+    const shouldForce = forceImportantDemoAssumptions;
+
+    if (botLocks[0] !== 2 || botLocks[1] !== 4) {
+      if (!shouldForce) {
+        reportRunError(`Important demo requires Bot 1 at Lock 2 and Bot 2 at Lock 4. Current: ${botLocks[0]} / ${botLocks[1]}.`);
+        return false;
+      }
+      setBotLock(0, 2);
+      setBotLock(1, 4);
+      pushLog("Important demo: forced Bot 1 to Lock 2 and Bot 2 to Lock 4");
+    }
+
+    if (!botsRef.current[0]?.online && !shouldForce) {
+      reportRunError("Important demo requires Bot 1 online.");
+      return false;
+    }
+    if (!botsRef.current[1]?.online && !shouldForce) {
+      reportRunError("Important demo requires Bot 2 online.");
+      return false;
+    }
+
+    const parsedA = parseScript(IMPORTANT_BOT1_SCRIPT);
+    const parsedB = parseScript(IMPORTANT_BOT2_SCRIPT);
+    const metaA = getScriptMeta(parsedA);
+    const metaB = getScriptMeta(parsedB);
+    if (metaA.errorCount > 0 || metaB.errorCount > 0) {
+      reportRunError("Important demo script has errors. Fix the preset text before running.");
+      return false;
+    }
+
+    setBusy(true);
+    pushLog("Important demo: run both scripts together");
+
+    try {
+      const ok = await Promise.all([
+        queueScriptBodyToBot(0, IMPORTANT_BOT1_SCRIPT),
+        queueScriptBodyToBot(1, IMPORTANT_BOT2_SCRIPT),
+      ]);
+      if (!ok[0] || !ok[1]) {
+        setBusy(false);
+        return false;
+      }
+
+      const [t0, t1] = await Promise.all([fetchEspEpochMs(0), fetchEspEpochMs(1)]);
+      if (t0 == null || t1 == null) {
+        reportRunError("Important demo sync start failed: time not available");
+        setBusy(false);
+        return false;
+      }
+
+      const startAt = Math.max(t0, t1) + SYNC_START_BUFFER_MS;
+      await Promise.all([startBotAt(0, startAt), startBotAt(1, startAt)]);
+      pushLog(`Important demo sync start at ${startAt}`);
+      return true;
+    } catch {
+      reportRunError("Important demo sync start failed");
+      return false;
+    } finally {
+      setBusy(false);
+    }
   }
 
   async function homeAll() {
@@ -1114,25 +1518,30 @@ export default function App() {
     try {
       const url = buildEspProxyUrl(bot.ip, "/status");
       console.log(`[Poll ${idx}] Fetching: ${url}`);
-      const statusRes = await fetchWithTimeout(url, {}, 1000);
+      const statusRes = await fetchWithTimeout(url, {}, 2000);
       console.log(`[Poll ${idx}] ${bot.ip} - status: ${statusRes.status}, ok: ${statusRes.ok}`);
-      
+
       if (!statusRes.ok) {
         const current = botsRef.current[idx];
-        const wasOnline = current?.online;
         const nextFailures = (current?.pollFailures || 0) + 1;
-        console.log(`[Poll ${idx}] Failed (${statusRes.status}) - wasOnline: ${wasOnline}, failures: ${nextFailures}`);
-        // Only transition to offline if was online and failures reached threshold
-        const shouldGoOffline = wasOnline && nextFailures >= OFFLINE_AFTER_FAILURES;
+        const lastMs = current?.lastSeenMs || 0;
+        const stillOnline = Date.now() - lastMs <= ONLINE_THRESHOLD_MS;
+        console.log(`[Poll ${idx}] Failed (${statusRes.status}) - failures: ${nextFailures}, lastSeenMs: ${lastMs}, stillOnline: ${stillOnline}`);
         patchBot(idx, {
           pollFailures: nextFailures,
-          online: shouldGoOffline ? false : wasOnline,
-          receiving: shouldGoOffline ? false : (wasOnline ? current?.receiving ?? false : false),
+          online: stillOnline,
+          receiving: stillOnline ? current?.receiving ?? false : false,
         });
         return;
       }
 
       const s = await statusRes.json();
+      try {
+        const resolvedIp = statusRes.headers.get?.("x-resolved-ip");
+        if (resolvedIp) resolvedIpCacheRef.current[bot.ip] = resolvedIp;
+      } catch (e) {
+        // ignore
+      }
       console.log(`[Poll ${idx}] Success - angles: ${s.angles}, running: ${s.running}`);
       const angles = Array.isArray(s.angles) ? s.angles.map((n) => Number(n) || 0).slice(0, SERVO_MAX) : [];
       const normalizedAngles = angles.length === SERVO_MAX ? angles : [83, 83, 86, 90, 90, 90, 90];
@@ -1150,22 +1559,22 @@ export default function App() {
         targets: normalizedAngles,
         progress: running ? 50 : 100,
         lastSeen: nowTime(),
+        lastSeenMs: Date.now(),
         sending: false,
         status: running ? "running" : "ready",
         pollFailures: 0,
       });
     } catch (err) {
       const current = botsRef.current[idx];
-      const wasOnline = current?.online;
       const nextFailures = (current?.pollFailures || 0) + 1;
-      const errMsg = err?.name === 'AbortError' ? 'timeout or aborted' : err?.message || 'unknown error';
-      console.log(`[Poll ${idx}] Exception - ${errMsg}, failures: ${nextFailures}`);
-      // Only transition to offline if was online and failures reached threshold
-      const shouldGoOffline = wasOnline && nextFailures >= OFFLINE_AFTER_FAILURES;
+      const lastMs = current?.lastSeenMs || 0;
+      const stillOnline = Date.now() - lastMs <= ONLINE_THRESHOLD_MS;
+      const errMsg = err?.name === "AbortError" ? "timeout or aborted" : err?.message || "unknown error";
+      console.log(`[Poll ${idx}] Exception - ${errMsg}, failures: ${nextFailures}, lastSeenMs: ${lastMs}, stillOnline: ${stillOnline}`);
       patchBot(idx, {
         pollFailures: nextFailures,
-        online: shouldGoOffline ? false : wasOnline,
-        receiving: shouldGoOffline ? false : (wasOnline ? current?.receiving ?? false : false),
+        online: stillOnline,
+        receiving: stillOnline ? current?.receiving ?? false : false,
       });
     } finally {
       patchBot(idx, { pollInFlight: false });
@@ -1176,39 +1585,134 @@ export default function App() {
     if (!gripperHost) return;
     try {
       const url = gripperUrl("/status");
-      const statusRes = await fetchWithTimeout(url, {}, 1000);
+      const statusRes = await fetchWithTimeout(url, {}, 2000);
       if (!statusRes.ok) {
-        setGripperOnline(false);
+        gripperFailuresRef.current = (gripperFailuresRef.current || 0) + 1;
+        const stillOnline = Date.now() - (gripperLastSeenMs || 0) <= ONLINE_THRESHOLD_MS;
+        console.log(`[Poll Gripper] non-ok ${statusRes.status}, stillOnline=${stillOnline}, failures=${gripperFailuresRef.current}`);
+        setGripperOnline(stillOnline);
         return;
       }
       const s = await statusRes.json();
+      try {
+        const resolvedIp = statusRes.headers.get?.("x-resolved-ip");
+        if (resolvedIp) resolvedIpCacheRef.current[gripperHost] = resolvedIp;
+      } catch (e) {
+        // ignore
+      }
+      gripperFailuresRef.current = 0;
       const angle = clampGripper(Number(s?.angle) || GRIPPER_HOME);
       setGripperAngle(angle);
       setGripperMoving(!!s?.moving);
       setGripperOnline(true);
       setGripperLastSeen(nowTime());
+      setGripperLastSeenMs(Date.now());
     } catch {
-      setGripperOnline(false);
+      gripperFailuresRef.current = (gripperFailuresRef.current || 0) + 1;
+      const stillOnline = Date.now() - (gripperLastSeenMs || 0) <= ONLINE_THRESHOLD_MS;
+      console.log(`[Poll Gripper] exception, stillOnline=${stillOnline}, failures=${gripperFailuresRef.current}`);
+      setGripperOnline(stillOnline);
+    }
+  }
+
+  async function pollLaser() {
+    if (!laserHost) return;
+    try {
+      const url = laserUrl("/status");
+      const statusRes = await fetchWithTimeout(url, {}, 2000);
+      if (!statusRes.ok) {
+        laserFailuresRef.current = (laserFailuresRef.current || 0) + 1;
+        const stillOnline = Date.now() - (laserLastSeenMs || 0) <= ONLINE_THRESHOLD_MS;
+        console.log(`[Poll Laser] non-ok ${statusRes.status}, stillOnline=${stillOnline}, failures=${laserFailuresRef.current}`);
+        setLaserOnline(stillOnline);
+        return;
+      }
+      const s = await statusRes.json();
+      try {
+        const resolvedIp = statusRes.headers.get?.("x-resolved-ip");
+        if (resolvedIp) resolvedIpCacheRef.current[laserHost] = resolvedIp;
+      } catch (e) {
+        // ignore
+      }
+      laserFailuresRef.current = 0;
+      const mode = typeof s?.mode === "string" ? s.mode.toLowerCase() : "off";
+      setLaserMode(LASER_MODES.includes(mode) ? mode : "off");
+      setLaserOnline(true);
+      setLaserLastSeen(nowTime());
+      setLaserLastSeenMs(Date.now());
+    } catch {
+      laserFailuresRef.current = (laserFailuresRef.current || 0) + 1;
+      const stillOnline = Date.now() - (laserLastSeenMs || 0) <= ONLINE_THRESHOLD_MS;
+      console.log(`[Poll Laser] exception, stillOnline=${stillOnline}, failures=${laserFailuresRef.current}`);
+      setLaserOnline(stillOnline);
     }
   }
 
   useEffect(() => {
-    pollBot(0);
-    pollBot(1);
-    const id = setInterval(() => {
-      pollBot(0);
-      pollBot(1);
-    }, POLL_MS);
-    return () => clearInterval(id);
+    const timers = [null, null];
+    let cancelled = false;
+
+    function scheduleBot(idx) {
+      const run = async () => {
+        if (cancelled) return;
+        await pollBot(idx);
+        if (cancelled) return;
+        const failures = botsRef.current[idx]?.pollFailures || 0;
+        const mult = Math.min(1 << failures, MAX_BACKOFF_MULTIPLIER);
+        const jitter = Math.random() * 300;
+        const delay = POLL_MS * mult + jitter;
+        timers[idx] = setTimeout(run, delay);
+      };
+      run();
+    }
+
+    scheduleBot(0);
+    scheduleBot(1);
+    return () => {
+      cancelled = true;
+      timers.forEach((t) => t && clearTimeout(t));
+    };
   }, []);
 
   useEffect(() => {
-    pollGripper();
-    const id = setInterval(() => {
-      pollGripper();
-    }, POLL_MS);
-    return () => clearInterval(id);
+    let timer = null;
+    let cancelled = false;
+    const run = async () => {
+      if (cancelled) return;
+      await pollGripper();
+      if (cancelled) return;
+      const failures = gripperFailuresRef.current || 0;
+      const mult = Math.min(1 << failures, MAX_BACKOFF_MULTIPLIER);
+      const jitter = Math.random() * 300;
+      const delay = POLL_MS * mult + jitter;
+      timer = setTimeout(run, delay);
+    };
+    run();
+    return () => {
+      cancelled = true;
+      if (timer) clearTimeout(timer);
+    };
   }, [gripperHost]);
+
+  useEffect(() => {
+    let timer = null;
+    let cancelled = false;
+    const run = async () => {
+      if (cancelled) return;
+      await pollLaser();
+      if (cancelled) return;
+      const failures = laserFailuresRef.current || 0;
+      const mult = Math.min(1 << failures, MAX_BACKOFF_MULTIPLIER);
+      const jitter = Math.random() * 300;
+      const delay = POLL_MS * mult + jitter;
+      timer = setTimeout(run, delay);
+    };
+    run();
+    return () => {
+      cancelled = true;
+      if (timer) clearTimeout(timer);
+    };
+  }, [laserHost]);
 
   const receivingCount = bots.filter((b) => b.receiving).length;
   const sendingCount = bots.filter((b) => b.sending).length;
@@ -1216,9 +1720,37 @@ export default function App() {
   const allIPsSet = bots.every((b) => b.ip && b.ip.length > 0);
   const globalStatusText = useMemo(() => (allIPsSet ? "Hosts ready" : "Host slots still empty"), [allIPsSet]);
 
+  const gripperFailuresRef = useRef(0);
+  const laserFailuresRef = useRef(0);
+  const MAX_BACKOFF_MULTIPLIER = 8; // cap exponential multiplier
+
   return (
     <div className="min-h-screen bg-[radial-gradient(circle_at_top,#0f172a_0%,#111827_38%,#f8fafc_100%)] text-slate-900">
-      <div className="mx-auto flex min-h-screen max-w-[1800px] flex-col px-4 py-4 lg:px-5">
+      <div className="fixed inset-x-0 top-0 z-50 border-b border-sky-100 bg-gradient-to-r from-white/95 via-sky-50/90 to-white/95 shadow-[0_6px_24px_rgba(2,132,199,0.12)] backdrop-blur">
+        <div className="mx-auto flex max-w-[1800px] items-center justify-between gap-3 px-4 py-3 lg:px-5">
+          <div className="flex items-center gap-2 truncate">
+            <div className="h-2.5 w-2.5 animate-pulse rounded-full bg-sky-500" />
+            <div className="truncate text-[15px] font-bold tracking-wide text-slate-900">TETROBOT CONTROL CENTER</div>
+          </div>
+          <div className="flex items-center gap-2 overflow-x-auto">
+            <div className={`inline-flex items-center gap-1 rounded-full border px-2.5 py-1 text-[11px] font-semibold ${bots[0]?.online ? "border-emerald-200 bg-emerald-50 text-emerald-700" : "border-rose-200 bg-rose-50 text-rose-700"}`}>
+              {bots[0]?.online ? <Wifi className="h-3 w-3" /> : <WifiOff className="h-3 w-3" />} Bot 1
+            </div>
+            <div className={`inline-flex items-center gap-1 rounded-full border px-2.5 py-1 text-[11px] font-semibold ${bots[1]?.online ? "border-emerald-200 bg-emerald-50 text-emerald-700" : "border-rose-200 bg-rose-50 text-rose-700"}`}>
+              {bots[1]?.online ? <Wifi className="h-3 w-3" /> : <WifiOff className="h-3 w-3" />} Bot 2
+            </div>
+            <div className={`inline-flex items-center gap-1 rounded-full border px-2.5 py-1 text-[11px] font-semibold ${gripperOnline ? "border-emerald-200 bg-emerald-50 text-emerald-700" : "border-rose-200 bg-rose-50 text-rose-700"}`}>
+              {gripperOnline ? <Wifi className="h-3 w-3" /> : <WifiOff className="h-3 w-3" />} Gripper
+            </div>
+            <div className={`inline-flex items-center gap-1 rounded-full border px-2.5 py-1 text-[11px] font-semibold ${laserOnline ? "border-amber-200 bg-amber-50 text-amber-700" : "border-rose-200 bg-rose-50 text-rose-700"}`}>
+              {laserOnline ? <Wifi className="h-3 w-3" /> : <WifiOff className="h-3 w-3" />} Lazer
+            </div>
+          </div>
+        </div>
+        {runError ? <div className="border-t border-rose-100 bg-rose-50 px-4 py-1.5 text-xs font-medium text-rose-700 lg:px-5">{runError}</div> : null}
+      </div>
+
+      <div className="mx-auto flex min-h-screen max-w-[1800px] flex-col px-4 py-4 pt-[86px] lg:px-5">
         <div className="mb-4 rounded-[30px] border border-slate-200 bg-white/90 p-4 shadow-[0_10px_35px_rgba(15,23,42,0.08)] backdrop-blur">
           <div className="flex flex-col gap-4 xl:flex-row xl:items-center xl:justify-between">
             <div>
@@ -1243,20 +1775,22 @@ export default function App() {
               >
                 {includeGripperSync ? "Gripper sync on" : "Gripper sync off"}
               </button>
-              <ToolbarButton icon={Play} label="Run All" onClick={() => runBothSameTime(false)} disabled={busy} active />
-              <ToolbarButton icon={RotateCcw} label="Reverse All" onClick={() => runBothSameTime(true)} disabled={busy} />
-              <ToolbarButton icon={Home} label="Home All" onClick={homeAll} disabled={busy} />
-              <ToolbarButton icon={Layers3} label="Body All" onClick={homeBodyAll} disabled={busy} />
-              <ToolbarButton icon={Home} label="Locks All" onClick={homeLocksAll} disabled={busy} />
-              <ToolbarButton icon={Square} label="Stop All" onClick={stopAll} disabled={busy} danger />
+              <button
+                onClick={() => setIncludeLaserSync((v) => !v)}
+                className={`rounded-full border px-3 py-1.5 text-xs transition ${includeLaserSync ? "border-amber-200 bg-amber-50 text-amber-700" : "border-slate-200 bg-white text-slate-600"}`}
+              >
+                {includeLaserSync ? "Laser sync on" : "Laser sync off"}
+              </button>
+              <ToolbarButton icon={Play} label="Run All" onClick={() => triggerAction("top-controls", () => runBothSameTime(false))} disabled={busy} active />
+              <ToolbarButton icon={RotateCcw} label="Reverse All" onClick={() => triggerAction("top-controls", () => runBothSameTime(true))} disabled={busy} />
+              <ToolbarButton icon={Home} label="Home All" onClick={() => triggerAction("top-controls", homeAll)} disabled={busy} />
+              <ToolbarButton icon={Layers3} label="Body All" onClick={() => triggerAction("top-controls", homeBodyAll)} disabled={busy} />
+              <ToolbarButton icon={Home} label="Locks All" onClick={() => triggerAction("top-controls", homeLocksAll)} disabled={busy} />
+              <ToolbarButton icon={Square} label="Stop All" onClick={() => triggerAction("top-controls", stopAll)} disabled={busy} danger />
             </div>
           </div>
 
-          {runError ? (
-            <div className="mt-4 rounded-2xl border border-rose-200 bg-rose-50 px-4 py-3 text-base font-semibold text-rose-700">
-              {runError}
-            </div>
-          ) : null}
+          {scopedErrors["top-controls"] ? <div className="mt-3 rounded-2xl border border-rose-200 bg-rose-50 px-4 py-2 text-sm text-rose-700">{scopedErrors["top-controls"]}</div> : null}
 
           <div className="mt-4 grid gap-3 lg:grid-cols-4">
             <StatCard icon={Activity} label="Requests Sent" value={sentRequests} sub="script uploads + direct commands" />
@@ -1318,6 +1852,8 @@ export default function App() {
             issueCount={parsed[0].reduce((acc, line) => acc + line.errors.length, 0)}
             gripperOnline={gripperOnline}
             gripperNeeded={parsedMeta[0].hasGripper}
+            laserOnline={laserOnline}
+            laserNeeded={parsedMeta[0].hasLaser}
           />
 
           <BotPanel
@@ -1348,21 +1884,29 @@ export default function App() {
             issueCount={parsed[1].reduce((acc, line) => acc + line.errors.length, 0)}
             gripperOnline={gripperOnline}
             gripperNeeded={parsedMeta[1].hasGripper}
+            laserOnline={laserOnline}
+            laserNeeded={parsedMeta[1].hasLaser}
           />
         </div>
 
         <div className="mt-4 rounded-[28px] border border-slate-200 bg-white p-4 shadow-[0_8px_30px_rgba(15,23,42,0.08)]">
           <div className="mb-4 flex items-center justify-between">
             <div>
-              <div className="text-lg font-semibold text-slate-900">Gripper Module</div>
+              <div className="text-lg font-semibold text-slate-900">Gripper + Laser</div>
               <div className="text-sm text-slate-500">Manual control + optional sync with Run All.</div>
             </div>
-            <div className={`inline-flex items-center gap-2 rounded-full px-2.5 py-1 text-xs font-semibold ${gripperOnline ? "bg-emerald-50 text-emerald-700" : "bg-slate-100 text-slate-500"}`}>
-              {gripperOnline ? <Wifi className="h-3.5 w-3.5" /> : <WifiOff className="h-3.5 w-3.5" />}
-              {gripperOnline ? "ONLINE" : "OFFLINE"}
+            <div className="flex items-center gap-2">
+              <div className={`inline-flex items-center gap-2 rounded-full px-2.5 py-1 text-xs font-semibold ${gripperOnline ? "bg-emerald-50 text-emerald-700" : "bg-slate-100 text-slate-500"}`}>
+                {gripperOnline ? <Wifi className="h-3.5 w-3.5" /> : <WifiOff className="h-3.5 w-3.5" />}
+                Gripper {gripperOnline ? "ONLINE" : "OFFLINE"}
+              </div>
+              <div className={`inline-flex items-center gap-2 rounded-full px-2.5 py-1 text-xs font-semibold ${laserOnline ? "bg-amber-50 text-amber-700" : "bg-slate-100 text-slate-500"}`}>
+                {laserOnline ? <Wifi className="h-3.5 w-3.5" /> : <WifiOff className="h-3.5 w-3.5" />}
+                Laser {laserOnline ? "ONLINE" : "OFFLINE"}
+              </div>
             </div>
           </div>
-          <div className="grid gap-4 lg:grid-cols-[1.1fr_0.9fr]">
+          <div className="grid gap-4 lg:grid-cols-[1.1fr_0.9fr_0.9fr]">
             <div className="rounded-3xl border border-slate-800 bg-slate-900 p-4">
               <div className="text-sm font-medium text-slate-200">Gripper Host / IP</div>
               <input
@@ -1408,6 +1952,34 @@ export default function App() {
               </div>
             </div>
             <div className="rounded-3xl border border-slate-800 bg-slate-900 p-4">
+              <div className="text-sm font-medium text-slate-200">Laser Host / Mode</div>
+              <input
+                value={laserHost}
+                onChange={(e) => setLaserHost(e.target.value.trim())}
+                placeholder="lazer.local or 10.0.0.202"
+                className="mt-2 w-full rounded-2xl border border-slate-700 bg-slate-800 px-4 py-3 text-sm text-slate-100 outline-none focus:border-amber-300"
+              />
+              <div className="mt-4">
+                <div className="text-xs text-slate-400">Mode</div>
+                <div className="mt-2 flex flex-wrap gap-2">
+                  {LASER_MODES.map((mode) => (
+                    <button
+                      key={mode}
+                      onClick={() => sendLaserMode(mode)}
+                      className={`rounded-2xl border px-4 py-2 text-sm shadow-sm ${
+                        laserMode === mode
+                          ? "border-amber-400/50 bg-amber-500/10 text-amber-200"
+                          : "border-slate-700 bg-slate-800 text-slate-100"
+                      }`}
+                    >
+                      {mode === "on" ? "On" : mode === "blink" ? "Blink" : "Off"}
+                    </button>
+                  ))}
+                </div>
+                <div className="mt-2 text-xs text-slate-400">Current: {laserMode} · last seen {laserLastSeen}</div>
+              </div>
+            </div>
+            <div className="rounded-3xl border border-slate-800 bg-slate-900 p-4">
               <div className="text-sm font-medium text-slate-200">Sync Status</div>
               <div className="mt-2 text-sm text-slate-300">Current: {gripperAngle}°</div>
               <div className="mt-1 text-sm text-slate-300">Target: {gripperTarget}°</div>
@@ -1424,6 +1996,12 @@ export default function App() {
                   className="rounded-2xl border border-emerald-400/40 bg-emerald-500/10 px-4 py-2 text-sm text-emerald-200 shadow-sm"
                 >
                   Enable Sync
+                </button>
+                <button
+                  onClick={() => setIncludeLaserSync(true)}
+                  className="rounded-2xl border border-amber-400/40 bg-amber-500/10 px-4 py-2 text-sm text-amber-200 shadow-sm"
+                >
+                  Laser Sync On
                 </button>
               </div>
             </div>
@@ -1486,7 +2064,9 @@ export default function App() {
                     wait2000<br />
                     home<br />
                     homebody<br />
-                    homelock
+                    homelock<br />
+                    g60<br />
+                    lazon
                   </div>
                 </div>
               )}
@@ -1539,14 +2119,14 @@ export default function App() {
               </div>
               <div className="mt-4 grid gap-3">
                 <button
-                  onClick={() => moveBot(0, 1, 2, BOT1_LOCK_1_TO_2)}
-                  className="rounded-3xl border border-slate-700 bg-slate-800 px-5 py-4 text-base font-semibold text-slate-100 shadow-sm"
+                  onClick={() => triggerAction("lock-moves", () => moveBot(0, 1, 2, BOT1_LOCK_1_TO_2))}
+                  className="rounded-3xl border border-slate-700 bg-slate-800 px-5 py-4 text-base font-semibold text-slate-100 shadow-sm transition-all duration-200 hover:-translate-y-0.5 hover:border-sky-400/50 hover:shadow-lg active:scale-[0.99]"
                 >
                   Move Bot 1: Lock 1 → Lock 2
                 </button>
                 <button
-                  onClick={() => moveBot(0, 2, 1, BOT1_LOCK_2_TO_1)}
-                  className="rounded-3xl border border-slate-700 bg-slate-800 px-5 py-4 text-base font-semibold text-slate-100 shadow-sm"
+                  onClick={() => triggerAction("lock-moves", () => moveBot(0, 2, 1, BOT1_LOCK_2_TO_1))}
+                  className="rounded-3xl border border-slate-700 bg-slate-800 px-5 py-4 text-base font-semibold text-slate-100 shadow-sm transition-all duration-200 hover:-translate-y-0.5 hover:border-sky-400/50 hover:shadow-lg active:scale-[0.99]"
                 >
                   Move Bot 1: Lock 2 → Lock 1
                 </button>
@@ -1569,35 +2149,112 @@ export default function App() {
               </div>
               <div className="mt-4 grid gap-3">
                 <button
-                  onClick={() => moveBot(1, 4, 3, BOT2_LOCK_4_TO_3)}
-                  className="rounded-3xl border border-slate-700 bg-slate-800 px-5 py-4 text-base font-semibold text-slate-100 shadow-sm"
+                  onClick={() => triggerAction("lock-moves", () => moveBot(1, 4, 3, BOT2_LOCK_4_TO_3))}
+                  className="rounded-3xl border border-slate-700 bg-slate-800 px-5 py-4 text-base font-semibold text-slate-100 shadow-sm transition-all duration-200 hover:-translate-y-0.5 hover:border-sky-400/50 hover:shadow-lg active:scale-[0.99]"
                 >
                   Move Bot 2: Lock 4 → Lock 3
                 </button>
                 <button
-                  onClick={() => moveBot(1, 3, 4, BOT2_LOCK_3_TO_4)}
-                  className="rounded-3xl border border-slate-700 bg-slate-800 px-5 py-4 text-base font-semibold text-slate-100 shadow-sm"
+                  onClick={() => triggerAction("lock-moves", () => moveBot(1, 3, 4, BOT2_LOCK_3_TO_4))}
+                  className="rounded-3xl border border-slate-700 bg-slate-800 px-5 py-4 text-base font-semibold text-slate-100 shadow-sm transition-all duration-200 hover:-translate-y-0.5 hover:border-sky-400/50 hover:shadow-lg active:scale-[0.99]"
                 >
                   Move Bot 2: Lock 3 → Lock 4
                 </button>
               </div>
             </div>
           </div>
+          {scopedErrors["lock-moves"] ? <div className="mt-3 rounded-2xl border border-rose-200 bg-rose-50 px-4 py-2 text-sm text-rose-700">{scopedErrors["lock-moves"]}</div> : null}
+        </div>
+
+        <div className="mt-4 grid gap-4 lg:grid-cols-2">
+          <div className="rounded-[28px] border border-slate-200 bg-white p-4 shadow-[0_8px_30px_rgba(15,23,42,0.08)]">
+            <div className="mb-4 flex items-center justify-between">
+              <div>
+                <div className="text-lg font-semibold text-slate-900">Gripper Demo</div>
+                <div className="text-sm text-slate-500">Requires Bot 1 at Lock 2 and gripper online.</div>
+              </div>
+            </div>
+            <button
+              onClick={() => triggerAction("gripper-demo", runGripperDemo)}
+              className="w-full rounded-[26px] border border-emerald-300 bg-gradient-to-r from-emerald-100 to-lime-100 px-6 py-5 text-lg font-semibold text-emerald-900 shadow-sm transition-all duration-200 hover:-translate-y-0.5 hover:shadow-lg active:scale-[0.99]"
+            >
+              Run Gripper Demo (Bot 1 + Gripper)
+            </button>
+            {scopedErrors["gripper-demo"] ? <div className="mt-3 rounded-2xl border border-rose-200 bg-rose-50 px-4 py-2 text-sm text-rose-700">{scopedErrors["gripper-demo"]}</div> : null}
+          </div>
+
+          <div className="rounded-[28px] border border-slate-200 bg-white p-4 shadow-[0_8px_30px_rgba(15,23,42,0.08)]">
+            <div className="mb-4 flex items-center justify-between gap-3">
+              <div>
+                <div className="text-lg font-semibold text-slate-900">Laser Demo</div>
+                <div className="text-sm text-slate-500">Assumes Bot 2 at Lock 4 and lazer online. Uses your exact script.</div>
+              </div>
+              <button
+                onClick={() => setForceLaserDemoAssumptions((v) => !v)}
+                className={`rounded-full border px-3 py-1.5 text-xs transition ${forceLaserDemoAssumptions ? "border-amber-200 bg-amber-50 text-amber-700" : "border-slate-200 bg-white text-slate-600"}`}
+              >
+                {forceLaserDemoAssumptions ? "Force assumptions on" : "Force assumptions off"}
+              </button>
+            </div>
+            <div className="rounded-3xl border border-slate-800 bg-slate-900 p-4">
+              <div className="text-xs text-slate-300">
+                Bot 2 must be on Lock 4. Laser commands used: lazon, lazblink, lazoff.
+              </div>
+              <button
+                onClick={() => triggerAction("laser-demo", runLaserDemo)}
+                className="mt-4 w-full rounded-[26px] border border-amber-400 bg-gradient-to-r from-amber-200 to-orange-200 px-6 py-5 text-lg font-semibold text-amber-900 shadow-sm transition-all duration-200 hover:-translate-y-0.5 hover:shadow-lg active:scale-[0.99]"
+              >
+                Run Laser Demo (Bot 2 + Lazer)
+              </button>
+              <div className="mt-3 text-xs text-slate-400">
+                {forceLaserDemoAssumptions
+                  ? "Force mode will set Bot 2 lock to 4 in the UI and bypass stale online assumptions for this run."
+                  : "Strict mode will stop if Bot 2 is not at Lock 4 or lazer is offline."}
+              </div>
+              {scopedErrors["laser-demo"] ? <div className="mt-3 rounded-2xl border border-rose-200 bg-rose-50 px-4 py-2 text-sm text-rose-700">{scopedErrors["laser-demo"]}</div> : null}
+            </div>
+          </div>
         </div>
 
         <div className="mt-4 rounded-[28px] border border-slate-200 bg-white p-4 shadow-[0_8px_30px_rgba(15,23,42,0.08)]">
-          <div className="mb-4 flex items-center justify-between">
+          <div className="mb-4 flex items-center justify-between gap-3">
             <div>
-              <div className="text-lg font-semibold text-slate-900">Gripper Demo</div>
-              <div className="text-sm text-slate-500">Requires Bot 1 at Lock 2 and gripper online.</div>
+              <div className="text-lg font-semibold text-slate-900">Important Dual Demo</div>
+              <div className="text-sm text-slate-500">Bot 1 at Lock 2 and Bot 2 at Lock 4. Both scripts start together.</div>
+            </div>
+            <button
+              onClick={() => setForceImportantDemoAssumptions((v) => !v)}
+              className={`rounded-full border px-3 py-1.5 text-xs transition ${forceImportantDemoAssumptions ? "border-sky-200 bg-sky-50 text-sky-700" : "border-slate-200 bg-white text-slate-600"}`}
+            >
+              {forceImportantDemoAssumptions ? "Force assumptions on" : "Force assumptions off"}
+            </button>
+          </div>
+          <div className="grid gap-4 lg:grid-cols-2">
+            <div className="rounded-3xl border border-slate-800 bg-slate-900 p-4">
+              <div className="text-xs text-slate-300">Bot 1 script</div>
+              <div className="mt-2 max-h-40 overflow-y-auto rounded-2xl border border-slate-700 bg-slate-950 p-3 font-mono text-[11px] leading-5 text-slate-200">
+                {IMPORTANT_BOT1_SCRIPT}
+              </div>
+            </div>
+            <div className="rounded-3xl border border-slate-800 bg-slate-900 p-4">
+              <div className="text-xs text-slate-300">Bot 2 script</div>
+              <div className="mt-2 max-h-40 overflow-y-auto rounded-2xl border border-slate-700 bg-slate-950 p-3 font-mono text-[11px] leading-5 text-slate-200">
+                {IMPORTANT_BOT2_SCRIPT}
+              </div>
             </div>
           </div>
           <button
-            onClick={runGripperDemo}
-            className="w-full rounded-[26px] border border-slate-200 bg-white px-6 py-5 text-lg font-semibold text-slate-900 shadow-sm"
+            onClick={() => triggerAction("important-dual", runImportantDualDemo)}
+            className="mt-4 w-full rounded-[26px] border border-sky-400 bg-gradient-to-r from-sky-200 to-cyan-200 px-6 py-5 text-lg font-semibold tracking-wide text-sky-900 shadow-sm transition-all duration-200 hover:-translate-y-0.5 hover:shadow-lg active:scale-[0.99]"
           >
-            Run Gripper Demo (Bot 1 + Gripper)
+            Run Important Dual Demo
           </button>
+          <div className="mt-3 text-xs text-slate-400">
+            {forceImportantDemoAssumptions
+              ? "Force mode sets the lock assumptions in the UI and uses the shared sync start path so both scripts begin together."
+              : "Strict mode requires the displayed lock states before running."}
+          </div>
+          {scopedErrors["important-dual"] ? <div className="mt-3 rounded-2xl border border-rose-200 bg-rose-50 px-4 py-2 text-sm text-rose-700">{scopedErrors["important-dual"]}</div> : null}
         </div>
       </div>
     </div>
