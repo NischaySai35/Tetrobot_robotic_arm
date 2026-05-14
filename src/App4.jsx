@@ -110,17 +110,26 @@ wait2000
 wait600
 2s40,3s30
 wait2000
-g30
+//gripper functions along with bot
+ghome
 wait1000
-g60
-wait1000
-2s60,3s30
-wait1000
-g20
-wait1500
-g90
-wait1500
+6s145
 wait2000
+1s40
+wait2000
+g40
+wait2000
+1s83
+wait2000
+6s90
+wait2000
+1s40
+wait1500
+ghome
+wait3000
+1s83
+wait2000
+//end-gripper-moves
 1s55,2s23,3s8
 wait3000
 1s49
@@ -129,7 +138,9 @@ wait2000
 wait3000
 1s56
 wait600
-2s40,3s30`;
+2s40,3s30
+wait2000
+homebody`;
 
 const LASER_DEMO_SCRIPT = `homebody
 wait1000
